@@ -11,9 +11,12 @@ Methods run sequentially with explicit garbage collection between them
 so the container does not OOM when both LIME and SHAP are enabled.
 
 USAGE:
-    pip install streamlit torch torchvision opencv-python-headless pillow numpy
-    pip install grad-cam shap lime scikit-image
+    pip install -r requirements.txt
     streamlit run dashboard.py
+
+The script expects:
+    - best_model.pth in the same directory
+    - Optional: a "samples/" folder with example X-rays for demo
 """
 
 import os
@@ -309,10 +312,10 @@ def main():
         st.markdown("""
         **Architecture**: EfficientNetB0  
         **Training**: Lung-region masked  
-        **Test AUC**: 0.9999  
-        **Sensitivity**: 0.981  
-        **Specificity**: 0.998  
-        **Threshold**: 0.8081 (Youden's J)
+        **Test AUC**: 0.9943  
+        **Sensitivity**: 0.9524  
+        **Specificity**: 0.9752  
+        **Threshold**: 0.5237 (Youden's J)
         """)
 
         st.markdown("---")
@@ -378,7 +381,7 @@ def main():
     tensor, display_rgb, img_uint8 = preprocess_image(pil_image, lung_mask)
 
     with st.spinner("Running AI analysis..."):
-        prediction = predict(model, tensor, threshold=0.8081)
+        prediction = predict(model, tensor, threshold=0.5237)
 
     pred = prediction["pred_class"]
     prob = prediction["prob_tb"]
@@ -413,13 +416,13 @@ def main():
     # ============================================================
     if view_mode == "All methods (side-by-side)":
         cols = st.columns(4)
-        cols[0].image(display_rgb, caption="Original (preprocessed)", use_container_width=True)
+        cols[0].image(display_rgb, caption="Original (preprocessed)", width="stretch")
 
         # 1. Grad-CAM
         with st.spinner("Computing Grad-CAM..."):
             try:
                 gradcam_overlay = compute_gradcam(model, tensor, display_rgb)
-                cols[1].image(gradcam_overlay, caption="Grad-CAM", use_container_width=True)
+                cols[1].image(gradcam_overlay, caption="Grad-CAM", width="stretch")
                 del gradcam_overlay
                 free_memory()
             except Exception as e:
@@ -431,7 +434,7 @@ def main():
                 try:
                     lime_overlay = compute_lime(model, img_uint8)
                     if lime_overlay is not None:
-                        cols[2].image(lime_overlay, caption="LIME", use_container_width=True)
+                        cols[2].image(lime_overlay, caption="LIME", width="stretch")
                     del lime_overlay
                     free_memory()
                 except Exception as e:
@@ -445,7 +448,7 @@ def main():
                 try:
                     shap_overlay = compute_shap(model, tensor, display_rgb, lung_mask)
                     if shap_overlay is not None:
-                        cols[3].image(shap_overlay, caption="SHAP", use_container_width=True)
+                        cols[3].image(shap_overlay, caption="SHAP", width="stretch")
                     del shap_overlay
                     free_memory()
                 except Exception as e:
@@ -455,30 +458,30 @@ def main():
 
     elif view_mode == "Grad-CAM only":
         cols = st.columns(2)
-        cols[0].image(display_rgb, caption="Original", use_container_width=True)
+        cols[0].image(display_rgb, caption="Original", width="stretch")
         with st.spinner("Computing Grad-CAM..."):
             gradcam_overlay = compute_gradcam(model, tensor, display_rgb)
-            cols[1].image(gradcam_overlay, caption="Grad-CAM heatmap", use_container_width=True)
+            cols[1].image(gradcam_overlay, caption="Grad-CAM heatmap", width="stretch")
 
     elif view_mode == "LIME only":
         if run_lime and HAS_LIME:
             cols = st.columns(2)
-            cols[0].image(display_rgb, caption="Original", use_container_width=True)
+            cols[0].image(display_rgb, caption="Original", width="stretch")
             with st.spinner("Computing LIME..."):
                 lime_overlay = compute_lime(model, img_uint8)
                 if lime_overlay is not None:
-                    cols[1].image(lime_overlay, caption="LIME superpixels", use_container_width=True)
+                    cols[1].image(lime_overlay, caption="LIME superpixels", width="stretch")
         else:
             st.info("Enable LIME in the sidebar to use this view.")
 
     elif view_mode == "SHAP only":
         if run_shap and HAS_SHAP:
             cols = st.columns(2)
-            cols[0].image(display_rgb, caption="Original", use_container_width=True)
+            cols[0].image(display_rgb, caption="Original", width="stretch")
             with st.spinner("Computing SHAP..."):
                 shap_overlay = compute_shap(model, tensor, display_rgb, lung_mask)
                 if shap_overlay is not None:
-                    cols[1].image(shap_overlay, caption="SHAP attribution", use_container_width=True)
+                    cols[1].image(shap_overlay, caption="SHAP attribution", width="stretch")
         else:
             st.info("Enable SHAP in the sidebar to use this view.")
 
@@ -491,7 +494,7 @@ def main():
         Grad-CAM produces a coarse heatmap from the gradients flowing into the
         last convolutional layer. Red regions are where the model attended most
         strongly when classifying. **In our evaluation, Grad-CAM had the highest
-        causal faithfulness (insertion/deletion AUC = +0.0736),** meaning its
+        causal faithfulness (insertion/deletion AUC = +0.1142),** meaning its
         highlighted regions are most strongly tied to the model's actual decision.
         """)
 
@@ -510,7 +513,7 @@ def main():
         SHAP uses Shapley values from cooperative game theory to attribute
         prediction differences to individual pixels. Red regions support the TB
         prediction. **SHAP achieved the best balance of causal faithfulness
-        (+0.0620) and clinical coherence (6.0/9 rubric score)** in our evaluation,
+        (+0.0691) and clinical coherence (5.71/9 rubric score)** in our evaluation,
         and is our recommended method for clinical interpretation.
         """)
 
@@ -538,7 +541,7 @@ Risk level: {risk}
 Decision threshold: {prediction['threshold']:.4f} (Youden's J)
 
 Model: EfficientNetB0 (lung-region masked)
-Test set performance: AUC = 0.9999, Sensitivity = 0.981, Specificity = 0.998
+Test set performance: AUC = 0.9943, Sensitivity = 0.9524, Specificity = 0.9752
 
 Recommended XAI: SHAP (combined faithfulness + clinical coherence)
 
