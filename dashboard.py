@@ -100,11 +100,18 @@ IMG_SIZE = 224
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-# Memory-tuned XAI parameters (cut from original to fit 1 GB RAM)
-LIME_NUM_SAMPLES = 200      # was 500
-LIME_BATCH_SIZE = 16        # was 32
-SHAP_NSAMPLES = 20          # was 50
-SHAP_BG_SIZE = 4            # was 10
+# Memory-tuned XAI parameters for 1 GB Streamlit Cloud free tier.
+# Cut from previous run because the second upload was OOM-killed silently.
+LIME_NUM_SAMPLES = 100      # was 200
+LIME_BATCH_SIZE = 8         # was 16
+SHAP_NSAMPLES = 10          # was 20
+SHAP_BG_SIZE = 2            # was 4
+
+# Reusable transform — built once, not per call
+_NORMALIZE_TRANSFORM = T.Compose([
+    T.ToTensor(),
+    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
 
 
 # ============================================================
@@ -144,6 +151,12 @@ def make_lung_oval_mask(size=224, vertical_stretch=1.1, horizontal_stretch=0.85)
 
 @st.cache_resource
 def load_model(weights_path="best_model.pth"):
+    """Load model once and discard the checkpoint dict immediately.
+
+    Previously we cached `(model, ckpt)` and held the full state dict in
+    memory forever — wasted ~20 MB across reruns. Now we extract weights,
+    load them, and let `ckpt` go out of scope so it can be GC'd.
+    """
     if not Path(weights_path).exists():
         st.error(f"Model weights not found at {weights_path}.")
         st.stop()
@@ -151,7 +164,9 @@ def load_model(weights_path="best_model.pth"):
     ckpt = torch.load(weights_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["state_dict"])
     model.eval().to(DEVICE)
-    return model, ckpt
+    del ckpt
+    gc.collect()
+    return model
 
 
 @st.cache_resource
@@ -177,12 +192,11 @@ def preprocess_image(pil_image, lung_mask):
     img_masked = (img_resized * lung_mask).astype(np.uint8)
     img_rgb = np.stack([img_masked, img_masked, img_masked], axis=-1)
 
-    transform = T.Compose([
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
-    tensor = transform(img_rgb).unsqueeze(0).to(DEVICE)
+    tensor = _NORMALIZE_TRANSFORM(img_rgb).unsqueeze(0).to(DEVICE)
     display_rgb = img_rgb.astype(np.float32) / 255.0
+
+    # Free intermediate arrays we no longer need
+    del img_array, img_gray, img_resized, img_masked, clahe
     return tensor, display_rgb, img_rgb
 
 
@@ -191,6 +205,8 @@ def predict(model, tensor, threshold=0.8081):
         logits = model(tensor)
         probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
     prob_tb, prob_normal = float(probs[1]), float(probs[0])
+    del logits, probs
+
     pred_class = "Tuberculosis" if prob_tb >= threshold else "Normal"
     if prob_tb < 0.20:
         risk = "LOW"
@@ -213,7 +229,7 @@ def compute_gradcam(model, tensor, display_rgb):
     targets = [ClassifierOutputTarget(1)]
     cam = cam_extractor(input_tensor=tensor, targets=targets)[0]
     overlay = show_cam_on_image(display_rgb, cam, use_rgb=True, image_weight=0.5)
-    del cam_extractor, cam
+    del cam_extractor, cam, targets, target_layers
     free_memory()
     return overlay
 
@@ -224,15 +240,14 @@ def compute_lime(model, img_uint8, num_samples=LIME_NUM_SAMPLES):
     explainer = lime_image.LimeImageExplainer()
 
     def predict_fn(images_batch):
-        transform = T.Compose([
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ])
-        batch = torch.stack([transform(img.astype(np.uint8)) for img in images_batch]).to(DEVICE)
+        # Use the module-level transform (no per-call rebuild)
+        batch = torch.stack([
+            _NORMALIZE_TRANSFORM(img.astype(np.uint8)) for img in images_batch
+        ]).to(DEVICE)
         with torch.no_grad():
             logits = model(batch)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
-        del batch
+        del batch, logits
         return probs
 
     explanation = explainer.explain_instance(
@@ -249,25 +264,25 @@ def compute_lime(model, img_uint8, num_samples=LIME_NUM_SAMPLES):
     )
     overlay = mark_boundaries(temp.astype(np.uint8) / 255.0, mask, color=(0, 1, 0), mode="thick")
     overlay = (overlay * 255).astype(np.uint8)
-    del explainer, explanation, temp, mask
+    del explainer, explanation, temp, mask, predict_fn
     free_memory()
     return overlay
 
 
 def get_shap_background(lung_mask, n_bg=SHAP_BG_SIZE):
     """Build a small background tensor for SHAP from random noise.
-    Not cached on purpose: re-creating is cheap and the cached tensor was
-    holding ~50 MB resident across predictions."""
+
+    Not cached on purpose: re-creating is cheap and a cached tensor was
+    previously holding ~50 MB resident across predictions. We also do NOT
+    use @st.cache_resource here for the same reason.
+    """
     bg = []
-    transform = T.Compose([
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
     for _ in range(n_bg):
         noise = np.random.randint(50, 200, (IMG_SIZE, IMG_SIZE), dtype=np.uint8)
         masked = (noise * lung_mask).astype(np.uint8)
-        rgb = np.stack([masked]*3, axis=-1)
-        bg.append(transform(rgb))
+        rgb = np.stack([masked] * 3, axis=-1)
+        bg.append(_NORMALIZE_TRANSFORM(rgb))
+        del noise, masked, rgb
     return torch.stack(bg).to(DEVICE)
 
 
@@ -376,7 +391,7 @@ def main():
             return
 
     pil_image = Image.open(uploaded).convert("RGB")
-    model, ckpt = load_model("best_model.pth")
+    model = load_model("best_model.pth")
     lung_mask = get_lung_mask()
     tensor, display_rgb, img_uint8 = preprocess_image(pil_image, lung_mask)
 
@@ -462,6 +477,8 @@ def main():
         with st.spinner("Computing Grad-CAM..."):
             gradcam_overlay = compute_gradcam(model, tensor, display_rgb)
             cols[1].image(gradcam_overlay, caption="Grad-CAM heatmap", width="stretch")
+            del gradcam_overlay
+            free_memory()
 
     elif view_mode == "LIME only":
         if run_lime and HAS_LIME:
@@ -471,6 +488,8 @@ def main():
                 lime_overlay = compute_lime(model, img_uint8)
                 if lime_overlay is not None:
                     cols[1].image(lime_overlay, caption="LIME superpixels", width="stretch")
+                del lime_overlay
+                free_memory()
         else:
             st.info("Enable LIME in the sidebar to use this view.")
 
@@ -482,6 +501,8 @@ def main():
                 shap_overlay = compute_shap(model, tensor, display_rgb, lung_mask)
                 if shap_overlay is not None:
                     cols[1].image(shap_overlay, caption="SHAP attribution", width="stretch")
+                del shap_overlay
+                free_memory()
         else:
             st.info("Enable SHAP in the sidebar to use this view.")
 
@@ -555,7 +576,7 @@ qualified radiologist review before clinical action.
         mime="text/plain",
     )
 
-    # Final cleanup at end of run
+    # Final cleanup at end of run — release everything before the next rerun
     del tensor, display_rgb, img_uint8, pil_image
     free_memory()
 
